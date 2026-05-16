@@ -60,11 +60,21 @@ class EarlyBranchResolver
     void squashAfter(ThreadID tid, InstSeqNum squashSeqNum);
 
     /**
-     * Attempt early resolution of a conditional direct branch.
-     * Returns true and sets `taken` if both source regs are free.
+     * Phase 1 — fetch time.
+     * Returns true and sets `taken` if both source regs have no pending writes.
      * Returns false if registers are busy (caller should use BPU).
      */
     bool tryResolve(const DynInstPtr &inst, ThreadID tid, bool &taken);
+
+    /**
+     * Phase 2 — wakeup time (called from IQ::wakeDependents).
+     * All source regs are now in the physical register file.
+     * Reads values directly and evaluates the branch condition.
+     * Returns true and sets `taken` if branch type is known.
+     * Also sets `mispredicted` if the result disagrees with predTaken.
+     */
+    bool tryResolveWakeup(const DynInstPtr &inst, ThreadID tid,
+                          bool &taken, bool &mispredicted);
 
     // Stats are public so bac.cc can increment override counters directly.
     struct EBRStats : public statistics::Group {
@@ -74,6 +84,8 @@ class EarlyBranchResolver
         statistics::Scalar fallbackNotCond;
         statistics::Scalar overrideTaken;
         statistics::Scalar overrideNotTaken;
+        statistics::Scalar resolvedAtWakeup;
+        statistics::Scalar wakeupMispredCorrections;
     } stats;
 
   private:

@@ -40,6 +40,7 @@
  */
 
 #include "cpu/o3/inst_queue.hh"
+#include "cpu/o3/cpu.hh"
 
 #include <limits>
 #include <vector>
@@ -1153,6 +1154,17 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst)
             dep_inst->markSrcRegReady();
 
             addIfReady(dep_inst);
+
+            // Phase 2 early branch resolution: if the branch is now fully
+            // ready, resolve it from the physical register file immediately.
+            if (dep_inst->readyToIssue() &&
+                !dep_inst->isSquashed() &&
+                dep_inst->staticInst->isCondCtrl() &&
+                dep_inst->staticInst->isDirectCtrl()) {
+                bool ebr_taken, ebr_mispred;
+                cpu->ebr.tryResolveWakeup(dep_inst, tid,
+                                          ebr_taken, ebr_mispred);
+            }
 
             dep_inst = dependGraph.pop(dest_reg->flatIndex());
 

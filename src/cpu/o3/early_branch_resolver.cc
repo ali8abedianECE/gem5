@@ -154,6 +154,53 @@ EarlyBranchResolver::evaluateCondition(const DynInstPtr &inst,
     return false;
 }
 
+bool
+EarlyBranchResolver::tryResolveWakeup(const DynInstPtr &inst, ThreadID tid,
+                                       bool &taken, bool &mispredicted)
+{
+    const StaticInstPtr &si = inst->staticInst;
+
+    if (!si->isCondCtrl() || !si->isDirectCtrl())
+        return false;
+    if (si->numSrcRegs() < 1)
+        return false;
+
+    // Read values straight from the physical register file.
+    // renamedSrcIdx(i) gives the PhysRegIdPtr; getRegOperand reads it.
+    RegVal v1 = inst->getRegOperand(si.get(), 0);
+    RegVal v2 = (si->numSrcRegs() >= 2) ? inst->getRegOperand(si.get(), 1) : 0;
+
+    const std::string &name = si->getName();
+    bool resolved = true;
+
+    if      (name == "beq"   || name == "c.beqz") taken = (v1 == v2);
+    else if (name == "bne"   || name == "c.bnez") taken = (v1 != v2);
+    else if (name == "blt")  taken = ((int64_t)v1 <  (int64_t)v2);
+    else if (name == "bge")  taken = ((int64_t)v1 >= (int64_t)v2);
+    else if (name == "bltu") taken = (v1 <  v2);
+    else if (name == "bgeu") taken = (v1 >= v2);
+    else resolved = false;
+
+    if (!resolved)
+        return false;
+
+    mispredicted = (taken != inst->readPredTaken());
+
+    ++stats.resolvedAtWakeup;
+    if (mispredicted)
+        ++stats.wakeupMispredCorrections;
+
+    DPRINTF(EarlyBranchResolver,
+            "[tid:%i] [sn:%llu] EBR wakeup resolved %s -> %s "
+            "(pred was %s, %s)\n",
+            tid, inst->seqNum, si->getName(),
+            taken ? "taken" : "not taken",
+            inst->readPredTaken() ? "taken" : "not taken",
+            mispredicted ? "MISPRED" : "correct");
+
+    return true;
+}
+
 EarlyBranchResolver::EBRStats::EBRStats(CPU *cpu)
     : statistics::Group(cpu, "earlyBranchResolver"),
       ADD_STAT(resolvedAtFetch, statistics::units::Count::get(),
@@ -165,7 +212,11 @@ EarlyBranchResolver::EBRStats::EBRStats(CPU *cpu)
       ADD_STAT(overrideTaken, statistics::units::Count::get(),
                "EBR overrode BPU from not-taken to taken"),
       ADD_STAT(overrideNotTaken, statistics::units::Count::get(),
-               "EBR overrode BPU from taken to not-taken")
+               "EBR overrode BPU from taken to not-taken"),
+      ADD_STAT(resolvedAtWakeup, statistics::units::Count::get(),
+               "Branches resolved at IQ wakeup time (Phase 2)"),
+      ADD_STAT(wakeupMispredCorrections, statistics::units::Count::get(),
+               "Wakeup resolutions that caught a BPU misprediction early")
 {}
 
 } // namespace o3
