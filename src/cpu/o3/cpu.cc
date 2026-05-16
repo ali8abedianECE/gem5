@@ -80,6 +80,7 @@ CPU::CPU(const BaseO3CPUParams &params)
       instcount(0),
 #endif
       removeInstsThisCycle(false),
+      ebr(this, params),
       bac(this, params),
       ftq(this, params),
       fetch(this, params),

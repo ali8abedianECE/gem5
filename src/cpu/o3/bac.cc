@@ -300,6 +300,9 @@ BAC::checkAndUpdateBPUSignals(ThreadID tid)
         squashBpuHistories(tid);
         squash(*fromCommit->commitInfo[tid].pc, tid);
 
+        // Remove wrong-path instructions from the EBR in-flight tracking.
+        cpu->ebr.squashAfter(tid, fromCommit->commitInfo[tid].doneSeqNum);
+
         // If it was a branch mispredict on a control instruction, update the
         // branch predictor with that instruction, otherwise just kill the
         // invalid state we generated in after sequence number
@@ -332,6 +335,9 @@ BAC::checkAndUpdateBPUSignals(ThreadID tid)
         // Update the branch predictor if it wasn't a squashed instruction
         // that was broadcasted.
         bpu->update(fromCommit->commitInfo[tid].doneSeqNum, tid);
+
+        // Release in-flight write tracking for committed instructions.
+        cpu->ebr.commitUpTo(tid, fromCommit->commitInfo[tid].doneSeqNum);
     }
 
     // Check squash signals from decode.
@@ -924,6 +930,35 @@ BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
             // here.
             predict_taken =
                 bpu->predict(inst->staticInst, inst->seqNum, fetch_pc, tid);
+
+            // Early Branch Resolver (EBR): attempt to resolve conditional
+            // direct branches immediately using committed register values.
+            // Always call bpu->predict() first so TAGE history is maintained.
+            // If EBR resolves and disagrees with the BPU, override direction
+            // and correct fetch_pc.
+            bool ebr_taken;
+            if (cpu->ebr.tryResolve(inst, tid, ebr_taken)) {
+                if (ebr_taken != predict_taken) {
+                    if (ebr_taken) {
+                        // BPU said not-taken; EBR says taken.
+                        // Compute direct branch target from static inst.
+                        auto tgt = inst->staticInst->branchTarget(
+                            inst->pcState());
+                        if (tgt) {
+                            set(fetch_pc, *tgt);
+                            ++stats.predTakenBranches;
+                            ++cpu->ebr.stats.overrideTaken;
+                        }
+                    } else {
+                        // BPU said taken; EBR says not-taken.
+                        // Restore sequential PC.
+                        set(fetch_pc, inst->pcState());
+                        inst->staticInst->advancePC(fetch_pc);
+                        ++cpu->ebr.stats.overrideNotTaken;
+                    }
+                    predict_taken = ebr_taken;
+                }
+            }
         }
 
         DPRINTF(BAC,
@@ -936,10 +971,6 @@ BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
 
         ++stats.branches;
 
-        if (predict_taken) {
-            ++stats.predTakenBranches;
-        }
-
     } else {
 
         // For non-branch instructions simply advance the PC.
@@ -948,6 +979,10 @@ BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
         inst->setPredTaken(false);
         predict_taken = false;
     }
+
+    // Track every fetched instruction's destination registers so EBR knows
+    // which architectural registers have in-flight writes.
+    cpu->ebr.notifyFetched(inst, tid);
 
     if (decoupledFrontEnd) {
 

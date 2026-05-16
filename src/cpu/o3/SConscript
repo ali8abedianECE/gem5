@@ -51,6 +51,7 @@ if env['CONF']['BUILD_ISA']:
         enums=['SMTFetchPolicy', 'SMTQueuePolicy', 'CommitPolicy'])
 
     Source('bac.cc')
+    Source('early_branch_resolver.cc')
     Source('commit.cc')
     Source('cpu.cc')
     Source('decode.cc')
@@ -74,6 +75,7 @@ if env['CONF']['BUILD_ISA']:
     Source('thread_state.cc')
 
     DebugFlag('BAC')
+    DebugFlag('EarlyBranchResolver')
     DebugFlag('CommitRate')
     DebugFlag('FTQ')
     DebugFlag('IEW')

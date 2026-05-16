@@ -55,6 +55,7 @@
 #include "cpu/activity.hh"
 #include "cpu/base.hh"
 #include "cpu/o3/bac.hh"
+#include "cpu/o3/early_branch_resolver.hh"
 #include "cpu/o3/comm.hh"
 #include "cpu/o3/commit.hh"
 #include "cpu/o3/decode.hh"
@@ -411,6 +412,9 @@ class CPU : public BaseCPU
     bool removeInstsThisCycle;
 
   protected:
+    /** Early branch resolver — resolves conditional branches at fetch. */
+    EarlyBranchResolver ebr;
+
     /** The branch and PC address calculation stage. */
     BAC bac;
 
