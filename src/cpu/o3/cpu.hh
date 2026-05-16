@@ -386,6 +386,9 @@ class CPU : public BaseCPU
     void dumpInsts();
 
   public:
+    /** Early branch resolver — resolves conditional branches at fetch. */
+    EarlyBranchResolver ebr;
+
 #ifndef NDEBUG
     /** Count of total number of dynamic instructions in flight. */
     int instcount;
@@ -412,9 +415,6 @@ class CPU : public BaseCPU
     bool removeInstsThisCycle;
 
   protected:
-    /** Early branch resolver — resolves conditional branches at fetch. */
-    EarlyBranchResolver ebr;
-
     /** The branch and PC address calculation stage. */
     BAC bac;
 
