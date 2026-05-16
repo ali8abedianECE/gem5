@@ -1297,11 +1297,22 @@ IEW::executeInsts()
                 fetchRedirect[tid] = true;
 
                 if (inst->isEarlyMispredicted()) {
-                    // EBR already fired squashDueToBranch + stats in
-                    // writebackInsts one cycle earlier — suppress duplicate.
+                    // Fetch was already redirected at wakeup time.
+                    // The pipeline is clean; this squashDueToBranch is a
+                    // no-op for the ROB.  Its sole purpose is to set
+                    // mispredictInst in toCommit so Commit propagates it to
+                    // BAC, which then calls bpu->squash() + bpu->update() at
+                    // the original timing — preserving TAGE history fidelity.
                     DPRINTF(IEW, "[tid:%i] [sn:%llu] Execute: "
-                            "EBR already handled this misprediction early.\n",
+                            "EBR deferred BPU squash firing now.\n",
                             tid, inst->seqNum);
+                    squashDueToBranch(inst, tid);
+                    ppMispredict->notify(inst);
+                    if (inst->readPredTaken()) {
+                        iewStats.predictedTakenIncorrect++;
+                    } else {
+                        iewStats.predictedNotTakenIncorrect++;
+                    }
                 } else {
                     DPRINTF(IEW, "[tid:%i] [sn:%llu] Execute: "
                             "Branch mispredict detected.\n",
@@ -1411,9 +1422,12 @@ IEW::writebackInsts()
                 inst->getFault() == NoFault) {
             int dependents = instQueue.wakeDependents(inst);
 
-            // EBR early squash: fire squash signals for any branches whose
-            // misprediction was detected at wakeup time above.  This is one
-            // cycle earlier than the normal execute-time detection.
+            // EBR early squash: redirect fetch one cycle before execute.
+            // We deliberately null out mispredictInst so that BAC does NOT
+            // rewind the BPU's global history this cycle.  The BPU squash
+            // (bpu->squash + bpu->update) is deferred to execute time, where
+            // it would happen in the normal flow, so TAGE history timing is
+            // unchanged.  Only fetch is redirected early.
             for (const DynInstPtr &mispred : instQueue.pendingEBRSquashes) {
                 if (mispred->isSquashed()) continue;
                 ThreadID mtid = mispred->threadNumber;
@@ -1422,11 +1436,10 @@ IEW::writebackInsts()
                         toCommit->squashedSeqNum[mtid] > mispred->seqNum) {
                     fetchRedirect[mtid] = true;
                     squashDueToBranch(mispred, mtid);
-                    ppMispredict->notify(mispred);
-                    if (mispred->readPredTaken())
-                        iewStats.predictedTakenIncorrect++;
-                    else
-                        iewStats.predictedNotTakenIncorrect++;
+                    // Null out mispredictInst: Commit still squashes the ROB
+                    // but will not set branchMispredict in commitInfo, so BAC
+                    // skips bpu->squash() this cycle.
+                    toCommit->mispredictInst[mtid] = nullptr;
                     ++cpu->ebr.stats.earlySquashesInitiated;
                 }
             }
