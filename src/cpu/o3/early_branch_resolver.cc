@@ -13,9 +13,9 @@ namespace gem5
 namespace o3
 {
 
-EarlyBranchResolver::EarlyBranchResolver(CPU *cpu,
+EarlyBranchResolver::EarlyBranchResolver(CPU *_cpu,
                                           const BaseO3CPUParams &params)
-    : cpu(cpu), stats(cpu)
+    : stats(_cpu), cpu(_cpu)
 {
     for (int tid = 0; tid < MaxThreads; tid++)
         for (int r = 0; r < MaxArchIntRegs; r++)
