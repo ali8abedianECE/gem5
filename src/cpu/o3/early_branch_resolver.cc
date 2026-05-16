@@ -89,7 +89,7 @@ EarlyBranchResolver::tryResolve(const DynInstPtr &inst, ThreadID tid,
     DPRINTF(EarlyBranchResolver,
             "[tid:%i] [sn:%llu] EBR resolved %s -> %s\n",
             tid, inst->seqNum,
-            inst->staticInst->getName(),
+            inst->staticInst->getName().c_str(),
             taken ? "taken" : "not taken");
 
     return true;
@@ -141,14 +141,14 @@ EarlyBranchResolver::evaluateCondition(const DynInstPtr &inst,
         v2 = (r2.index() == 0) ? 0 : cpu->getArchReg(r2, tid);
     }
 
-    const std::string &name = si->getName();
+    const std::string &mnemonic = si->getName();
 
-    if (name == "beq"   || name == "c.beqz") return v1 == v2;
-    if (name == "bne"   || name == "c.bnez") return v1 != v2;
-    if (name == "blt")  return (int64_t)v1 <  (int64_t)v2;
-    if (name == "bge")  return (int64_t)v1 >= (int64_t)v2;
-    if (name == "bltu") return v1 <  v2;
-    if (name == "bgeu") return v1 >= v2;
+    if (mnemonic == "beq"   || mnemonic == "c.beqz") return v1 == v2;
+    if (mnemonic == "bne"   || mnemonic == "c.bnez") return v1 != v2;
+    if (mnemonic == "blt")  return (int64_t)v1 <  (int64_t)v2;
+    if (mnemonic == "bge")  return (int64_t)v1 >= (int64_t)v2;
+    if (mnemonic == "bltu") return v1 <  v2;
+    if (mnemonic == "bgeu") return v1 >= v2;
 
     // Unknown branch type — can't resolve, treated as fallback
     return false;
@@ -170,15 +170,15 @@ EarlyBranchResolver::tryResolveWakeup(const DynInstPtr &inst, ThreadID tid,
     RegVal v1 = inst->getRegOperand(si.get(), 0);
     RegVal v2 = (si->numSrcRegs() >= 2) ? inst->getRegOperand(si.get(), 1) : 0;
 
-    const std::string &name = si->getName();
+    const std::string &mnemonic = si->getName();
     bool resolved = true;
 
-    if      (name == "beq"   || name == "c.beqz") taken = (v1 == v2);
-    else if (name == "bne"   || name == "c.bnez") taken = (v1 != v2);
-    else if (name == "blt")  taken = ((int64_t)v1 <  (int64_t)v2);
-    else if (name == "bge")  taken = ((int64_t)v1 >= (int64_t)v2);
-    else if (name == "bltu") taken = (v1 <  v2);
-    else if (name == "bgeu") taken = (v1 >= v2);
+    if      (mnemonic == "beq"   || mnemonic == "c.beqz") taken = (v1 == v2);
+    else if (mnemonic == "bne"   || mnemonic == "c.bnez") taken = (v1 != v2);
+    else if (mnemonic == "blt")  taken = ((int64_t)v1 <  (int64_t)v2);
+    else if (mnemonic == "bge")  taken = ((int64_t)v1 >= (int64_t)v2);
+    else if (mnemonic == "bltu") taken = (v1 <  v2);
+    else if (mnemonic == "bgeu") taken = (v1 >= v2);
     else resolved = false;
 
     if (!resolved)
@@ -193,7 +193,7 @@ EarlyBranchResolver::tryResolveWakeup(const DynInstPtr &inst, ThreadID tid,
     DPRINTF(EarlyBranchResolver,
             "[tid:%i] [sn:%llu] EBR wakeup resolved %s -> %s "
             "(pred was %s, %s)\n",
-            tid, inst->seqNum, si->getName(),
+            tid, inst->seqNum, si->getName().c_str(),
             taken ? "taken" : "not taken",
             inst->readPredTaken() ? "taken" : "not taken",
             mispredicted ? "MISPRED" : "correct");
