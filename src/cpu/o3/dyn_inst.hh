@@ -539,6 +539,18 @@ class DynInst : public ExecContext, public RefCounted
         return *next_pc != *predPC;
     }
 
+    // EBR early-squash support: set at IQ wakeup time when EBR determines
+    // that the branch is mispredicted before it reaches the execute stage.
+    bool _earlyMispredicted = false;
+    bool _earlyTaken = false;
+
+    void setEarlyMispredicted(bool taken) {
+        _earlyMispredicted = true;
+        _earlyTaken = taken;
+    }
+    bool isEarlyMispredicted() const { return _earlyMispredicted; }
+    bool getEarlyTaken() const { return _earlyTaken; }
+
     //
     //  Instruction types.  Forward checks to StaticInst object.
     //

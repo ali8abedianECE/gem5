@@ -1162,8 +1162,26 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst)
                 dep_inst->staticInst->isCondCtrl() &&
                 dep_inst->staticInst->isDirectCtrl()) {
                 bool ebr_taken, ebr_mispred;
-                cpu->ebr.tryResolveWakeup(dep_inst, tid,
-                                          ebr_taken, ebr_mispred);
+                if (cpu->ebr.tryResolveWakeup(dep_inst, tid,
+                                              ebr_taken, ebr_mispred) &&
+                        ebr_mispred) {
+                    dep_inst->setEarlyMispredicted(ebr_taken);
+                    if (ebr_taken) {
+                        // Pre-set npc to branch target so squashDueToBranch
+                        // redirects fetch to the correct address.
+                        auto tgt = dep_inst->staticInst->branchTarget(
+                            dep_inst->pcState());
+                        if (tgt) {
+                            // pcState() is const — clone, set npc, write back
+                            std::unique_ptr<PCStateBase> npc_state(
+                                dep_inst->pcState().clone());
+                            npc_state->as<GenericISA::PCStateWithNext>()
+                                .npc(tgt->instAddr());
+                            dep_inst->pcState(*npc_state);
+                        }
+                    }
+                    pendingEBRSquashes.push_back(dep_inst);
+                }
             }
 
             dep_inst = dependGraph.pop(dest_reg->flatIndex());

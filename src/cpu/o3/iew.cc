@@ -1296,24 +1296,29 @@ IEW::executeInsts()
             if (inst->mispredicted() && !loadNotExecuted) {
                 fetchRedirect[tid] = true;
 
-                DPRINTF(IEW, "[tid:%i] [sn:%llu] Execute: "
-                        "Branch mispredict detected.\n",
-                        tid, inst->seqNum);
-                DPRINTF(IEW, "[tid:%i] [sn:%llu] "
-                        "Predicted target was PC: %s\n",
-                        tid, inst->seqNum, inst->readPredTarg());
-                DPRINTF(IEW, "[tid:%i] [sn:%llu] Execute: "
-                        "Redirecting fetch to PC: %s\n",
-                        tid, inst->seqNum, inst->pcState());
-                // If incorrect, then signal the ROB that it must be squashed.
-                squashDueToBranch(inst, tid);
-
-                ppMispredict->notify(inst);
-
-                if (inst->readPredTaken()) {
-                    iewStats.predictedTakenIncorrect++;
+                if (inst->isEarlyMispredicted()) {
+                    // EBR already fired squashDueToBranch + stats in
+                    // writebackInsts one cycle earlier — suppress duplicate.
+                    DPRINTF(IEW, "[tid:%i] [sn:%llu] Execute: "
+                            "EBR already handled this misprediction early.\n",
+                            tid, inst->seqNum);
                 } else {
-                    iewStats.predictedNotTakenIncorrect++;
+                    DPRINTF(IEW, "[tid:%i] [sn:%llu] Execute: "
+                            "Branch mispredict detected.\n",
+                            tid, inst->seqNum);
+                    DPRINTF(IEW, "[tid:%i] [sn:%llu] "
+                            "Predicted target was PC: %s\n",
+                            tid, inst->seqNum, inst->readPredTarg());
+                    DPRINTF(IEW, "[tid:%i] [sn:%llu] Execute: "
+                            "Redirecting fetch to PC: %s\n",
+                            tid, inst->seqNum, inst->pcState());
+                    squashDueToBranch(inst, tid);
+                    ppMispredict->notify(inst);
+                    if (inst->readPredTaken()) {
+                        iewStats.predictedTakenIncorrect++;
+                    } else {
+                        iewStats.predictedNotTakenIncorrect++;
+                    }
                 }
             } else if (ldstQueue.violation(tid)) {
                 assert(inst->isMemRef());
@@ -1405,6 +1410,27 @@ IEW::writebackInsts()
         if (!inst->isSquashed() && inst->isExecuted() &&
                 inst->getFault() == NoFault) {
             int dependents = instQueue.wakeDependents(inst);
+
+            // EBR early squash: fire squash signals for any branches whose
+            // misprediction was detected at wakeup time above.  This is one
+            // cycle earlier than the normal execute-time detection.
+            for (const DynInstPtr &mispred : instQueue.pendingEBRSquashes) {
+                if (mispred->isSquashed()) continue;
+                ThreadID mtid = mispred->threadNumber;
+                if (!fetchRedirect[mtid] ||
+                        !toCommit->squash[mtid] ||
+                        toCommit->squashedSeqNum[mtid] > mispred->seqNum) {
+                    fetchRedirect[mtid] = true;
+                    squashDueToBranch(mispred, mtid);
+                    ppMispredict->notify(mispred);
+                    if (mispred->readPredTaken())
+                        iewStats.predictedTakenIncorrect++;
+                    else
+                        iewStats.predictedNotTakenIncorrect++;
+                    ++cpu->ebr.stats.earlySquashesInitiated;
+                }
+            }
+            instQueue.pendingEBRSquashes.clear();
 
             for (int i = 0; i < inst->numDestRegs(); i++) {
                 // Mark register as ready if not pinned

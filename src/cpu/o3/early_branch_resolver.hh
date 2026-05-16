@@ -86,6 +86,7 @@ class EarlyBranchResolver
         statistics::Scalar overrideNotTaken;
         statistics::Scalar resolvedAtWakeup;
         statistics::Scalar wakeupMispredCorrections;
+        statistics::Scalar earlySquashesInitiated;
     } stats;
 
   private:

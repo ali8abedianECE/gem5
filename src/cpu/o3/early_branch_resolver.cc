@@ -216,7 +216,9 @@ EarlyBranchResolver::EBRStats::EBRStats(CPU *cpu)
       ADD_STAT(resolvedAtWakeup, statistics::units::Count::get(),
                "Branches resolved at IQ wakeup time (Phase 2)"),
       ADD_STAT(wakeupMispredCorrections, statistics::units::Count::get(),
-               "Wakeup resolutions that caught a BPU misprediction early")
+               "Wakeup resolutions that caught a BPU misprediction early"),
+      ADD_STAT(earlySquashesInitiated, statistics::units::Count::get(),
+               "Squashes initiated at wakeup time (1 cycle before execute)")
 {}
 
 } // namespace o3

@@ -331,6 +331,10 @@ class InstructionQueue
     /** Wakes all dependents of a completed instruction. */
     int wakeDependents(const DynInstPtr &completed_inst);
 
+    /** EBR early-squash: branches detected mispredicted at wakeup time.
+     *  Populated by wakeDependents(), drained and cleared by IEW::writebackInsts(). */
+    std::vector<DynInstPtr> pendingEBRSquashes;
+
     /** Adds a ready memory instruction to the ready list. */
     void addReadyMemInst(const DynInstPtr &ready_inst);
 
