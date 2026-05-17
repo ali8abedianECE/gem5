@@ -916,6 +916,11 @@ BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
     bool predict_taken;
     ThreadID tid = inst->threadNumber;
 
+    // Track every fetched instruction's destination registers so EBR knows
+    // which architectural registers have in-flight writes.  Must happen before
+    // branch prediction so the loop predictor's specIter is current.
+    cpu->ebr.notifyFetched(inst, tid);
+
     if (inst->isControl()) {
         // The instruction is a control instruction.
 
@@ -958,6 +963,20 @@ BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
                     }
                     predict_taken = ebr_taken;
                 }
+            } else {
+                // Phase 1 failed (source regs busy).
+                // Phase 1.5: EBR loop predictor — if we are at the learned
+                // exit iteration, override TAGE with not-taken.
+                bool loop_taken;
+                if (cpu->ebr.tryResolveLoop(inst, tid, loop_taken)) {
+                    if (loop_taken != predict_taken) {
+                        // loop_taken is always false (exit), so BPU said taken.
+                        // Restore sequential PC (loop exit = not-taken).
+                        set(fetch_pc, inst->pcState());
+                        inst->staticInst->advancePC(fetch_pc);
+                    }
+                    predict_taken = loop_taken;
+                }
             }
         }
 
@@ -979,10 +998,6 @@ BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
         inst->setPredTaken(false);
         predict_taken = false;
     }
-
-    // Track every fetched instruction's destination registers so EBR knows
-    // which architectural registers have in-flight writes.
-    cpu->ebr.notifyFetched(inst, tid);
 
     if (decoupledFrontEnd) {
 

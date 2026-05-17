@@ -551,6 +551,13 @@ class DynInst : public ExecContext, public RefCounted
     bool isEarlyMispredicted() const { return _earlyMispredicted; }
     bool getEarlyTaken() const { return _earlyTaken; }
 
+    // EBR loop predictor: speculative iteration count at fetch time.
+    // Set by EBR::notifyFetched for conditional branches; read at Phase 2
+    // wakeup to learn the loop trip count on not-taken (exit) outcomes.
+    uint16_t _loopFetchIter = 0;
+    void     setLoopFetchIter(uint16_t v) { _loopFetchIter = v; }
+    uint16_t getLoopFetchIter() const { return _loopFetchIter; }
+
     //
     //  Instruction types.  Forward checks to StaticInst object.
     //

@@ -67,11 +67,21 @@ class EarlyBranchResolver
     bool tryResolve(const DynInstPtr &inst, ThreadID tid, bool &taken);
 
     /**
+     * Phase 1.5 — loop predictor, fetch time.
+     * For conditional direct branches whose source regs are busy, checks
+     * whether the per-PC speculative iteration counter equals the learned
+     * trip count.  If so, overrides TAGE with "not-taken" (loop exit).
+     * Returns true and sets `taken` if a high-confidence prediction is made.
+     */
+    bool tryResolveLoop(const DynInstPtr &inst, ThreadID tid, bool &taken);
+
+    /**
      * Phase 2 — wakeup time (called from IQ::wakeDependents).
      * All source regs are now in the physical register file.
      * Reads values directly and evaluates the branch condition.
      * Returns true and sets `taken` if branch type is known.
      * Also sets `mispredicted` if the result disagrees with predTaken.
+     * Also updates the loop predictor with the actual outcome.
      */
     bool tryResolveWakeup(const DynInstPtr &inst, ThreadID tid,
                           bool &taken, bool &mispredicted);
@@ -84,6 +94,11 @@ class EarlyBranchResolver
         statistics::Scalar fallbackNotCond;
         statistics::Scalar overrideTaken;
         statistics::Scalar overrideNotTaken;
+        // Loop predictor (Phase 1.5)
+        statistics::Scalar loopPredOverride;
+        statistics::Scalar loopPredCorrect;
+        statistics::Scalar loopPredWrong;
+        // Phase 2
         statistics::Scalar resolvedAtWakeup;
         statistics::Scalar wakeupMispredCorrections;
         statistics::Scalar earlySquashesInitiated;
@@ -96,16 +111,37 @@ class EarlyBranchResolver
 
     CPU *cpu;
 
-    // Tracks (seqNum -> [destIntRegIdx...]) for instructions in flight.
+    // Tracks (seqNum -> [destIntRegIdx...]) and loop-branch info in flight.
     struct InFlightEntry {
         InstSeqNum seqNum;
         std::vector<int> destIntRegs;
+        // Loop predictor: if this is a conditional branch, record the
+        // PC table index so squashAfter can decrement the specIter.
+        int  loopPcIdx = -1;   // -1 means not a tracked loop branch
     };
     std::deque<InFlightEntry> inFlight[MaxThreads];
 
     // Number of in-flight writes to each architectural integer register.
     static constexpr int MaxArchIntRegs = 32;
     int pendingWrites[MaxThreads][MaxArchIntRegs];
+
+    // ── Loop predictor (Phase 1.5) ────────────────────────────────────────
+    // Per-PC table: learns the trip count (number of taken outcomes before
+    // a not-taken exit) and predicts "not-taken" on the exit iteration.
+    static constexpr int LOOP_TABLE_BITS = 10;
+    static constexpr int LOOP_TABLE_SIZE = 1 << LOOP_TABLE_BITS;
+    static constexpr uint8_t LOOP_CONF_MAX  = 3;   // 2-bit saturating
+    static constexpr uint8_t LOOP_CONF_HIGH = 2;   // threshold to predict
+
+    struct LoopEntry {
+        uint16_t tripCount = 0;   // learned exit iteration (taken count)
+        uint16_t specIter  = 0;   // speculative fetch-time iter counter
+        uint8_t  conf      = 0;   // 2-bit saturating confidence
+        bool     valid     = false;
+    };
+    LoopEntry loopTable[MaxThreads][LOOP_TABLE_SIZE];
+
+    int loopPcIdx(Addr pc) const { return (pc >> 1) & (LOOP_TABLE_SIZE - 1); }
 };
 
 } // namespace o3
