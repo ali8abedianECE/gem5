@@ -18,9 +18,6 @@ namespace o3
 namespace {
 
 // ── RegId cache ───────────────────────────────────────────────────────────────
-// Populated lazily in notifyFetched (where the full RegId is available from
-// staticInst->destRegIdx).  Used in commitUpTo so we can call getArchReg
-// without constructing a RegId from a raw integer index (no public ctor).
 RegId intRegIdCache  [MaxThreads][32];
 bool  intRegIdCached [MaxThreads][32] = {};
 
@@ -30,7 +27,25 @@ static constexpr uint8_t STRIDE_CONF_HIGH = 2;
 
 RegVal  strideLastVal[MaxThreads][32] = {};  // last committed value
 int64_t strideVal    [MaxThreads][32] = {};  // learned stride
-uint8_t strideConf   [MaxThreads][32] = {};  // 2-bit saturating confidence
+uint8_t strideConf   [MaxThreads][32] = {};  // saturating confidence
+
+// ── In-flight write classification ───────────────────────────────────────────
+// Separate in-flight writes into two classes:
+//   consistent  — rd is also a source (in-place: addi k, k, 1).
+//                 Predicted value = committed_val + count * stride.
+//   breaking    — rd is NOT a source (copy/init: mv j, lo; lw t0, mem).
+//                 Signals that the stride history is stale; block prediction.
+//
+// Per-register counters are rebuilt from writeKinds[] after squash.
+int8_t strideConsistentInFlight[MaxThreads][32] = {};
+int8_t strideBreakingInFlight  [MaxThreads][32] = {};
+
+struct InFlightWriteKind {
+    InstSeqNum          seqNum;
+    std::vector<int>    destIntRegs;  // register indices (parallel to consistency)
+    std::vector<int8_t> consistency;  // +1 = consistent, -1 = breaking
+};
+std::deque<InFlightWriteKind> writeKinds[MaxThreads];
 
 // ── Loop predictor pending-exit queue ────────────────────────────────────────
 struct PendingLoopExit {
@@ -63,8 +78,12 @@ EarlyBranchResolver::notifyFetched(const DynInstPtr &inst, ThreadID tid)
     InFlightEntry entry;
     entry.seqNum = inst->seqNum;
 
-    for (int i = 0; i < inst->staticInst->numDestRegs(); i++) {
-        const RegId &reg = inst->staticInst->destRegIdx(i);
+    InFlightWriteKind kindEntry;
+    kindEntry.seqNum = inst->seqNum;
+
+    const StaticInstPtr &si0 = inst->staticInst;
+    for (int i = 0; i < si0->numDestRegs(); i++) {
+        const RegId &reg = si0->destRegIdx(i);
         if (reg.classValue() == IntRegClass) {
             int idx = reg.index();
             if (idx != 0) {
@@ -74,26 +93,35 @@ EarlyBranchResolver::notifyFetched(const DynInstPtr &inst, ThreadID tid)
                     intRegIdCache[tid][idx]  = reg;
                     intRegIdCached[tid][idx] = true;
                 }
-                // Detect register-reset writes (addi rd, x0, imm / mv rd, x0).
-                // Any write sourced from the zero register sets the dest to a
-                // constant, breaking the stride sequence.  Invalidate at fetch
-                // so the stride predictor doesn't fire on stale history during
-                // the reset transition (before the reset write commits).
-                const StaticInstPtr &si = inst->staticInst;
-                for (int s = 0; s < si->numSrcRegs(); s++) {
-                    const RegId &sr = si->srcRegIdx(s);
-                    if (sr.classValue() == IntRegClass && sr.index() == 0) {
-                        strideConf[tid][idx] = 0;  // reset → invalidate
+                // Classify: consistent = rd is also a source (in-place update,
+                // e.g. addi k,k,1); breaking = rd is not a source (copy/init/
+                // load, e.g. mv j,lo_reg or lw t0,mem).  Breaking writes make
+                // the committed stride value stale; block stride prediction
+                // while any breaking write to that register is in-flight.
+                bool isConsistent = false;
+                for (int s = 0; s < si0->numSrcRegs(); s++) {
+                    const RegId &sr = si0->srcRegIdx(s);
+                    if (sr.classValue() == IntRegClass && sr.index() == idx) {
+                        isConsistent = true;
                         break;
                     }
                 }
+                if (isConsistent)
+                    strideConsistentInFlight[tid][idx]++;
+                else
+                    strideBreakingInFlight[tid][idx]++;
+
+                kindEntry.destIntRegs.push_back(idx);
+                kindEntry.consistency.push_back(isConsistent ? int8_t(1) : int8_t(-1));
             }
         }
     }
 
+    if (!kindEntry.destIntRegs.empty())
+        writeKinds[tid].push_back(std::move(kindEntry));
+
     // Loop predictor: record the speculative iteration for conditional direct branches.
-    const StaticInstPtr &si = inst->staticInst;
-    if (si->isCondCtrl() && si->isDirectCtrl() && si->numSrcRegs() >= 1) {
+    if (si0->isCondCtrl() && si0->isDirectCtrl() && si0->numSrcRegs() >= 1) {
         int idx = loopPcIdx(inst->pcState().instAddr());
         int inFlightCount = 0;
         for (const auto &e : inFlight[tid])
@@ -148,6 +176,23 @@ EarlyBranchResolver::commitUpTo(ThreadID tid, InstSeqNum doneSeqNum)
             }
         }
 
+        // Drain writeKinds entry for this instruction (seqNum-matched).
+        if (!writeKinds[tid].empty() &&
+            writeKinds[tid].front().seqNum == front.seqNum) {
+            const auto &wk = writeKinds[tid].front();
+            for (int j = 0; j < (int)wk.destIntRegs.size(); j++) {
+                int r = wk.destIntRegs[j];
+                if (wk.consistency[j] > 0) {
+                    if (strideConsistentInFlight[tid][r] > 0)
+                        strideConsistentInFlight[tid][r]--;
+                } else {
+                    if (strideBreakingInFlight[tid][r] > 0)
+                        strideBreakingInFlight[tid][r]--;
+                }
+            }
+            writeKinds[tid].pop_front();
+        }
+
         inFlight[tid].pop_front();
     }
 }
@@ -165,6 +210,10 @@ EarlyBranchResolver::squashAfter(ThreadID tid, InstSeqNum squashSeqNum)
            pendingExits[tid].back().seqNum > squashSeqNum)
         pendingExits[tid].pop_back();
 
+    while (!writeKinds[tid].empty() &&
+           writeKinds[tid].back().seqNum > squashSeqNum)
+        writeKinds[tid].pop_back();
+
     rebuildCounts(tid);
 }
 
@@ -173,14 +222,21 @@ EarlyBranchResolver::squashAfter(ThreadID tid, InstSeqNum squashSeqNum)
 void
 EarlyBranchResolver::rebuildCounts(ThreadID tid)
 {
-    // Only rebuild pendingWrites; stride tables and committedIter are
-    // based on committed state and are unaffected by squash.
-    for (int r = 0; r < MaxArchIntRegs; r++)
+    for (int r = 0; r < MaxArchIntRegs; r++) {
         pendingWrites[tid][r] = 0;
-
-    for (const auto &entry : inFlight[tid])
-        for (int r : entry.destIntRegs)
+        strideConsistentInFlight[tid][r] = 0;
+        strideBreakingInFlight[tid][r] = 0;
+    }
+    for (const auto &wk : writeKinds[tid]) {
+        for (int j = 0; j < (int)wk.destIntRegs.size(); j++) {
+            int r = wk.destIntRegs[j];
             pendingWrites[tid][r]++;
+            if (wk.consistency[j] > 0)
+                strideConsistentInFlight[tid][r]++;
+            else
+                strideBreakingInFlight[tid][r]++;
+        }
+    }
 }
 
 // ── tryResolve (Phase 1 + Phase 1b stride) ───────────────────────────────────
@@ -201,14 +257,9 @@ EarlyBranchResolver::tryResolve(const DynInstPtr &inst, ThreadID tid,
         bool strideUsed = false;
         for (int i = 0; i < si2->numSrcRegs() && i < 2 && !strideUsed; i++) {
             const RegId &reg = si2->srcRegIdx(i);
-            if (reg.classValue() == IntRegClass && reg.index() != 0) {
-                for (const auto &e : inFlight[tid]) {
-                    if (e.seqNum > inst->seqNum) break;
-                    for (int r : e.destIntRegs)
-                        if (r == reg.index()) { strideUsed = true; break; }
-                    if (strideUsed) break;
-                }
-            }
+            if (reg.classValue() == IntRegClass && reg.index() != 0 &&
+                strideConsistentInFlight[tid][reg.index()] > 0)
+                strideUsed = true;
         }
 
         if (strideUsed) {
@@ -216,21 +267,18 @@ EarlyBranchResolver::tryResolve(const DynInstPtr &inst, ThreadID tid,
                 // Taken-with-stride: let BPU decide (unreliable).
                 return false;
             }
-            // Not-taken-with-stride: only override for blt/bltu when the
-            // predicted counter exactly equals the bound (v1 == v2).
-            // If v1 > v2 (overshoot from reset-transition), fall back.
-            const std::string &mnem = si2->getName();
-            if (mnem == "blt" || mnem == "bltu") {
-                // Re-read values using writes-up-to-this-branch.
+            // Not-taken-with-stride (loop exit prediction): require the
+            // stride-predicted values to be exactly at the boundary.
+            // blt/bltu not-taken means v1 >= v2; exact boundary = v1 == v2.
+            // bne/c.bnez not-taken means v1 == v2; evaluateCondition already
+            // checked this (v1_pred == v2), so require confirmation via the
+            // stride-predicted readVal as well.
+            // In both cases: if v1_pred != v2, something is off — fall back.
+            {
                 auto readVal = [&](const RegId &r) -> RegVal {
                     int idx = r.index();
                     if (idx == 0) return 0;
-                    int wb = 0;
-                    for (const auto &e : inFlight[tid]) {
-                        if (e.seqNum > inst->seqNum) break;
-                        for (int rr : e.destIntRegs)
-                            if (rr == idx) wb++;
-                    }
+                    int wb = strideConsistentInFlight[tid][idx];
                     if (wb > 0 && strideConf[tid][idx] >= STRIDE_CONF_HIGH)
                         return (RegVal)((int64_t)strideLastVal[tid][idx] +
                                        (int64_t)wb * strideVal[tid][idx]);
@@ -240,7 +288,7 @@ EarlyBranchResolver::tryResolve(const DynInstPtr &inst, ThreadID tid,
                 RegVal v2 = (si2->numSrcRegs() >= 2) ?
                              readVal(si2->srcRegIdx(1)) : RegVal(0);
                 if (v1 != v2)
-                    return false;  // overshoot — likely reset transition
+                    return false;
             }
         }
     }
@@ -276,25 +324,21 @@ EarlyBranchResolver::canResolve(const DynInstPtr &inst, ThreadID tid)
     int srcs = si->numSrcRegs();
     if (srcs < 1) return false;
 
-    // Count writes-before-this-branch for each source reg.
-    // This correctly excludes speculated instructions fetched *after* this
-    // branch, which would otherwise inflate the stride prediction.
-    auto writesUpTo = [&](int regIdx) -> int {
-        int count = 0;
-        for (const auto &e : inFlight[tid]) {
-            if (e.seqNum > inst->seqNum) break;
-            for (int r : e.destIntRegs)
-                if (r == regIdx) count++;
-        }
-        return count;
-    };
-
     int busyCount = 0;
     for (int i = 0; i < srcs && i < 2; i++) {
         const RegId &reg = si->srcRegIdx(i);
         if (reg.classValue() != IntRegClass) return false;
         int idx = reg.index();
-        if (idx != 0 && writesUpTo(idx) > 0)
+        if (idx == 0) continue;
+
+        // Any breaking write in-flight (copy/load/init) means the stride
+        // history is stale for this register — block prediction entirely.
+        if (strideBreakingInFlight[tid][idx] > 0) {
+            ++stats.fallbackBusy;
+            return false;
+        }
+
+        if (strideConsistentInFlight[tid][idx] > 0)
             busyCount++;
     }
 
@@ -306,15 +350,28 @@ EarlyBranchResolver::canResolve(const DynInstPtr &inst, ThreadID tid)
     }
 
     if (busyCount == 1) {
+        // For stride-based override, require high confidence.
         for (int i = 0; i < srcs && i < 2; i++) {
             const RegId &reg = si->srcRegIdx(i);
             if (reg.classValue() != IntRegClass) return false;
             int idx = reg.index();
-            if (idx != 0 && writesUpTo(idx) > 0 &&
+            if (idx == 0) continue;
+            if (strideConsistentInFlight[tid][idx] > 0 &&
                 strideConf[tid][idx] < STRIDE_CONF_HIGH) {
                 ++stats.fallbackBusy;
                 return false;
             }
+        }
+        // Stride-based not-taken overrides are only safe for branch types where
+        // the not-taken condition is an exact POINT (not a range).
+        // blt/bltu  not-taken: a >= b — exact boundary = a == b ✓
+        // bne/c.bnez not-taken: a == b — exact point ✓
+        // beq/bge/bgeu not-taken: range conditions — stride overrides unreliable.
+        const std::string &mnem = si->getName();
+        if (mnem != "blt" && mnem != "bltu" &&
+            mnem != "bne" && mnem != "c.bnez") {
+            ++stats.fallbackBusy;
+            return false;
         }
     }
 
@@ -332,29 +389,15 @@ EarlyBranchResolver::evaluateCondition(const DynInstPtr &inst,
 {
     const StaticInstPtr &si = inst->staticInst;
 
-    // Count writes to each source register from instructions *at or before*
-    // this branch in program order.  pendingWrites[] includes speculated
-    // instructions fetched *after* this branch, which would inflate the
-    // stride prediction and produce wrong not-taken overrides.
-    auto writesBeforeBranch = [&](int regIdx) -> int {
-        int count = 0;
-        for (const auto &e : inFlight[tid]) {
-            if (e.seqNum > inst->seqNum) break;
-            for (int r : e.destIntRegs)
-                if (r == regIdx) count++;
-        }
-        return count;
-    };
-
+    // strideConsistentInFlight counts in-place writes (addi k,k,1) fetched
+    // before this branch — correct to use for stride-predicted value.
     auto readReg = [&](const RegId &r) -> RegVal {
         int idx = r.index();
         if (idx == 0) return 0;
-        int wb = writesBeforeBranch(idx);
-        if (wb > 0 && strideConf[tid][idx] >= STRIDE_CONF_HIGH) {
-            // Stride prediction using only writes up to this branch.
+        int wb = strideConsistentInFlight[tid][idx];
+        if (wb > 0 && strideConf[tid][idx] >= STRIDE_CONF_HIGH)
             return (RegVal)((int64_t)strideLastVal[tid][idx] +
                             (int64_t)wb * strideVal[tid][idx]);
-        }
         return cpu->getArchReg(r, tid);
     };
 
