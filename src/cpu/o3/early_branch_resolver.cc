@@ -267,14 +267,17 @@ EarlyBranchResolver::tryResolve(const DynInstPtr &inst, ThreadID tid,
                 // Taken-with-stride: let BPU decide (unreliable).
                 return false;
             }
-            // Not-taken-with-stride (loop exit prediction): require the
-            // stride-predicted values to be exactly at the boundary.
-            // blt/bltu not-taken means v1 >= v2; exact boundary = v1 == v2.
-            // bne/c.bnez not-taken means v1 == v2; evaluateCondition already
-            // checked this (v1_pred == v2), so require confirmation via the
-            // stride-predicted readVal as well.
-            // In both cases: if v1_pred != v2, something is off — fall back.
-            {
+            // Count stride-busy sources to choose the right safety check.
+            int strideCount = 0;
+            for (int i = 0; i < si2->numSrcRegs() && i < 2; i++) {
+                const RegId &r2 = si2->srcRegIdx(i);
+                if (r2.classValue() == IntRegClass && r2.index() != 0 &&
+                    strideConsistentInFlight[tid][r2.index()] > 0)
+                    strideCount++;
+            }
+            if (strideCount < 2) {
+                // Single-busy: require exact boundary (v1_pred == v2_committed).
+                // This guards against stride overrides far from the exit point.
                 auto readVal = [&](const RegId &r) -> RegVal {
                     int idx = r.index();
                     if (idx == 0) return 0;
@@ -290,6 +293,8 @@ EarlyBranchResolver::tryResolve(const DynInstPtr &inst, ThreadID tid,
                 if (v1 != v2)
                     return false;
             }
+            // Dual-busy: both values are stride-predicted with high confidence;
+            // evaluateCondition already computed the not-taken result from them.
         }
     }
 
@@ -342,11 +347,27 @@ EarlyBranchResolver::canResolve(const DynInstPtr &inst, ThreadID tid)
             busyCount++;
     }
 
-    // Only stride-predict when exactly one source is busy (loop counter vs.
-    // constant).  Both busy → data-dependent comparison → fallback to BPU.
-    if (busyCount >= 2) {
+    if (busyCount > 2) {
         ++stats.fallbackBusy;
         return false;
+    }
+
+    if (busyCount == 2) {
+        // Dual-counter loop: both sources have consistent in-flight writes
+        // (e.g. bge a1,s0 where addiw a1,a1,-1 and addiw s0,s0,1 are in-flight).
+        // Allow stride resolution when both have high confidence.
+        for (int i = 0; i < srcs && i < 2; i++) {
+            const RegId &reg = si->srcRegIdx(i);
+            if (reg.classValue() != IntRegClass) { ++stats.fallbackBusy; return false; }
+            int idx = reg.index();
+            if (idx == 0) continue;
+            if (strideConsistentInFlight[tid][idx] > 0 &&
+                strideConf[tid][idx] < STRIDE_CONF_HIGH) {
+                ++stats.fallbackBusy;
+                return false;
+            }
+        }
+        return true;
     }
 
     if (busyCount == 1) {

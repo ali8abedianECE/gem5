@@ -834,11 +834,14 @@ Commit::commit()
                 fromIEW->branchTaken[tid];
             toIEW->commitInfo[tid].squashInst =
                                     rob->findInst(tid, squashed_inst);
+            toIEW->commitInfo[tid].ebrCorrection =
+                fromIEW->ebrCorrection[tid];
             if (toIEW->commitInfo[tid].mispredictInst) {
                 if (toIEW->commitInfo[tid].mispredictInst->isUncondCtrl()) {
                      toIEW->commitInfo[tid].branchTaken = true;
                 }
-                ++stats.branchMispredicts;
+                if (!fromIEW->ebrCorrection[tid])
+                    ++stats.branchMispredicts;
             }
 
             set(toIEW->commitInfo[tid].pc, fromIEW->pc[tid]);

@@ -128,6 +128,17 @@ class BPredUnit : public SimObject
                 bool actually_taken, ThreadID tid, bool from_commit=true);
 
     /**
+     * Phase 2 EBR correction squash: like squash(sn, corr, actual) but does
+     * NOT set mispredict=true on the predHist entry.  Called when EBR has
+     * already resolved the branch direction from the PRF at wakeup time, so
+     * the prediction is "corrected" rather than retroactively mispredicted.
+     * This prevents condIncorrect from being incremented at commit.
+     */
+    void correctSquash(const InstSeqNum &squashed_sn,
+                       const PCStateBase &corr_target,
+                       bool actually_taken, ThreadID tid);
+
+    /**
      * Looks up a given PC in the BTB to see if a matching entry exists.
      * @param tid The thread id.
      * @param pc The PC to look up.

@@ -297,6 +297,7 @@ IEW::clearStates(ThreadID tid)
         iew_struct.branchMispredict[tid] = false;
         iew_struct.branchTaken[tid] = false;
         iew_struct.includeSquashInst[tid] = false;
+        iew_struct.ebrCorrection[tid] = false;
     }
 
     // Clear out any of this thread's instructions being sent from
@@ -1142,6 +1143,7 @@ IEW::executeInsts()
 
     for (ThreadID tid : *activeThreads) {
         fetchRedirect[tid] = false;
+        toCommit->ebrCorrection[tid] = false;
     }
 
     // Uncomment this if you want to see all available instructions.
@@ -1421,7 +1423,22 @@ IEW::writebackInsts()
                         !toCommit->squash[mtid] ||
                         toCommit->squashedSeqNum[mtid] > mispred->seqNum) {
                     fetchRedirect[mtid] = true;
+                    bool ebr_taken = mispred->getEarlyTaken();
+                    // Fix pcState redirect for the not-taken case: if BPU
+                    // predicted taken but EBR says not-taken, the pcState.npc
+                    // still points at the branch target.  Override to fall-through
+                    // so squashDueToBranch computes the correct redirect PC.
+                    if (!ebr_taken && mispred->readPredTaken()) {
+                        std::unique_ptr<PCStateBase> pcs(
+                            mispred->pcState().clone());
+                        auto &p = pcs->as<GenericISA::PCStateWithNext>();
+                        p.npc(p.pc() + mispred->staticInst->size());
+                        mispred->pcState(*pcs);
+                    }
                     squashDueToBranch(mispred, mtid);
+                    // Mark as EBR correction so BAC calls correctSquash
+                    // (hist->mispredict stays false → condIncorrect not ++).
+                    toCommit->ebrCorrection[mtid] = true;
                     ppMispredict->notify(mispred);
                     if (mispred->readPredTaken())
                         iewStats.predictedTakenIncorrect++;
@@ -1449,6 +1466,38 @@ IEW::writebackInsts()
             }
             iewStats.writebackCount[tid]++;
         }
+    }
+
+    // Flush any EBR squashes queued at dispatch time (immediately-ready
+    // branches) that weren't processed inside the loop above because no
+    // instructions completed this cycle.
+    if (!instQueue.pendingEBRSquashes.empty()) {
+        for (const DynInstPtr &mispred : instQueue.pendingEBRSquashes) {
+            if (mispred->isSquashed()) continue;
+            ThreadID mtid = mispred->threadNumber;
+            if (!fetchRedirect[mtid] ||
+                    !toCommit->squash[mtid] ||
+                    toCommit->squashedSeqNum[mtid] > mispred->seqNum) {
+                fetchRedirect[mtid] = true;
+                bool ebr_taken = mispred->getEarlyTaken();
+                if (!ebr_taken && mispred->readPredTaken()) {
+                    std::unique_ptr<PCStateBase> pcs(
+                        mispred->pcState().clone());
+                    auto &p = pcs->as<GenericISA::PCStateWithNext>();
+                    p.npc(p.pc() + mispred->staticInst->size());
+                    mispred->pcState(*pcs);
+                }
+                squashDueToBranch(mispred, mtid);
+                toCommit->ebrCorrection[mtid] = true;
+                ppMispredict->notify(mispred);
+                if (mispred->readPredTaken())
+                    iewStats.predictedTakenIncorrect++;
+                else
+                    iewStats.predictedNotTakenIncorrect++;
+                ++cpu->ebr.stats.earlySquashesInitiated;
+            }
+        }
+        instQueue.pendingEBRSquashes.clear();
     }
 }
 

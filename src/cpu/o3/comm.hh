@@ -100,6 +100,9 @@ struct IEWStruct
     bool branchMispredict[MaxThreads];
     bool branchTaken[MaxThreads];
     bool includeSquashInst[MaxThreads];
+    // Set when Phase 2 EBR fires a correction squash (not a true mispredict).
+    // Prevents BAC from marking predHist entry with mispredict=true.
+    bool ebrCorrection[MaxThreads];
 };
 
 struct IssueStruct
@@ -225,6 +228,11 @@ struct TimeStruct
         /// Hack for now to send back an strictly ordered access to
         /// the IEW stage.
         bool strictlyOrdered = false; // *I
+
+        /// Set when the squash originated from Phase 2 EBR correction.
+        /// Tells BAC to call correctSquash instead of squash (avoids
+        /// marking predHist entry as mispredict → prevents condIncorrect++).
+        bool ebrCorrection = false; // *F
 
     };
 

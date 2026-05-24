@@ -700,6 +700,34 @@ InstructionQueue::insert(const DynInstPtr &new_inst)
         memDepUnit[new_inst->threadNumber].insert(new_inst);
     } else {
         addIfReady(new_inst);
+        // Phase 2 for immediately-ready branches: all sources were already in
+        // the scoreboard at dispatch time (the producing instruction completed
+        // between fetch and dispatch).  wakeDependents will never fire for
+        // these, so run Phase 2 here to catch BPU mispredictions.
+        if (new_inst->readyToIssue() &&
+            !new_inst->isSquashed() &&
+            new_inst->staticInst->isCondCtrl() &&
+            new_inst->staticInst->isDirectCtrl()) {
+            ThreadID tid = new_inst->threadNumber;
+            bool ebr_taken, ebr_mispred;
+            if (cpu->ebr.tryResolveWakeup(new_inst, tid,
+                                          ebr_taken, ebr_mispred) &&
+                    ebr_mispred) {
+                new_inst->setEarlyMispredicted(ebr_taken);
+                if (ebr_taken) {
+                    auto tgt = new_inst->staticInst->branchTarget(
+                        new_inst->pcState());
+                    if (tgt) {
+                        std::unique_ptr<PCStateBase> npc_state(
+                            new_inst->pcState().clone());
+                        npc_state->as<GenericISA::PCStateWithNext>()
+                            .npc(tgt->instAddr());
+                        new_inst->pcState(*npc_state);
+                    }
+                }
+                pendingEBRSquashes.push_back(new_inst);
+            }
+        }
     }
 
     ++iqStats.instsAdded;

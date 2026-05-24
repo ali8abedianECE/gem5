@@ -309,11 +309,22 @@ BAC::checkAndUpdateBPUSignals(ThreadID tid)
         if (fromCommit->commitInfo[tid].mispredictInst &&
             fromCommit->commitInfo[tid].mispredictInst->isControl()) {
 
-            bpu->squash(fromCommit->commitInfo[tid].doneSeqNum,
-                        *fromCommit->commitInfo[tid].pc,
-                        fromCommit->commitInfo[tid].branchTaken, tid, true);
-            stats.branchMisspredict++;
-            stats.squashBranchCommit++;
+            if (fromCommit->commitInfo[tid].ebrCorrection) {
+                // Phase 2 EBR correction: redirect fetch but do NOT mark
+                // the predHist entry as mispredicted (hist->mispredict stays
+                // false) so condIncorrect is not incremented at commit.
+                bpu->correctSquash(fromCommit->commitInfo[tid].doneSeqNum,
+                                   *fromCommit->commitInfo[tid].pc,
+                                   fromCommit->commitInfo[tid].branchTaken,
+                                   tid);
+                stats.squashBranchCommit++;
+            } else {
+                bpu->squash(fromCommit->commitInfo[tid].doneSeqNum,
+                            *fromCommit->commitInfo[tid].pc,
+                            fromCommit->commitInfo[tid].branchTaken, tid, true);
+                stats.branchMisspredict++;
+                stats.squashBranchCommit++;
+            }
         } else {
             bpu->squash(fromCommit->commitInfo[tid].doneSeqNum, tid);
             if (fromCommit->commitInfo[tid].mispredictInst) {

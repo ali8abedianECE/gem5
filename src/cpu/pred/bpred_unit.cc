@@ -588,6 +588,54 @@ BPredUnit::squash(const InstSeqNum &squashed_sn,
     }
 }
 
+// Phase 2 EBR correction: identical to squash(sn,corr,actual) except that
+// hist->mispredict is left false.  The branch will commit as "correct" so
+// condIncorrect is not incremented, but hist->actuallyTaken is set correctly
+// so the underlying predictor still learns the right direction at commit.
+void
+BPredUnit::correctSquash(const InstSeqNum &squashed_sn,
+                         const PCStateBase &corr_target,
+                         bool actually_taken, ThreadID tid)
+{
+    squash(squashed_sn, tid);
+
+    if (!predHist[tid].empty()) {
+        PredictorHistory *hist = predHist[tid].front();
+
+        hist->actuallyTaken = actually_taken;
+        set(hist->target, corr_target);
+        // hist->mispredict intentionally left false.
+
+        cPred->update(tid, hist->pc, actually_taken, hist->bpHistory,
+                      true, hist->inst, corr_target.instAddr());
+
+        if (iPred) {
+            iPred->update(tid, squashed_sn, hist->pc,
+                          true, actually_taken, corr_target,
+                          hist->type, hist->indirectHistory);
+        }
+
+        if (ras) {
+            if (actually_taken && (hist->rasHistory == nullptr)) {
+                if (hist->type == BranchType::Return)
+                    ras->pop(tid, hist->rasHistory);
+                if (hist->call) {
+                    auto return_addr = hist->inst->buildRetPC(
+                                           corr_target, corr_target);
+                    if (hist->inst->size())
+                        return_addr->set(hist->pc + hist->inst->size());
+                    ras->push(tid, *return_addr, hist->rasHistory);
+                }
+            } else if (!actually_taken && (hist->rasHistory != nullptr)) {
+                ras->squash(tid, hist->rasHistory);
+            }
+        }
+
+        if (actually_taken && updateBTBAtSquash)
+            updateBTB(tid, hist);
+    }
+}
+
 void
 BPredUnit::updateBTB(ThreadID tid, PredictorHistory *&hist)
 {
