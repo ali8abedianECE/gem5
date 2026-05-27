@@ -63,10 +63,17 @@ EarlyBranchResolver::EarlyBranchResolver(CPU *_cpu,
     : stats(_cpu), cpu(_cpu)
 {
     for (int tid = 0; tid < MaxThreads; tid++) {
-        for (int r = 0; r < MaxArchIntRegs; r++)
-            pendingWrites[tid][r] = 0;
+        for (int r = 0; r < MaxArchIntRegs; r++) {
+            pendingWrites[tid][r]    = 0;
+            regCommitCount[tid][r]   = 0;
+        }
         for (int i = 0; i < LOOP_TABLE_SIZE; i++)
             loopTable[tid][i] = LoopEntry{};
+        for (int i = 0; i < CC_PC_SIZE; i++) {
+            ccVisit[tid][i] = CCVisitEntry{};
+            for (int d = 0; d < CC_DELTA_MOD; d++)
+                ccPred[tid][i][d] = CC_CONF_INIT;  // neutral: requires 4 same-dir outcomes
+        }
     }
 }
 
@@ -120,9 +127,11 @@ EarlyBranchResolver::notifyFetched(const DynInstPtr &inst, ThreadID tid)
     if (!kindEntry.destIntRegs.empty())
         writeKinds[tid].push_back(std::move(kindEntry));
 
-    // Loop predictor: record the speculative iteration for conditional direct branches.
+    // Loop predictor + CC predictor: only for conditional direct branches.
     if (si0->isCondCtrl() && si0->isDirectCtrl() && si0->numSrcRegs() >= 1) {
         int idx = loopPcIdx(inst->pcState().instAddr());
+
+        // Loop predictor (Phase 1.5)
         int inFlightCount = 0;
         for (const auto &e : inFlight[tid])
             if (e.loopPcIdx == idx) inFlightCount++;
@@ -130,6 +139,34 @@ EarlyBranchResolver::notifyFetched(const DynInstPtr &inst, ThreadID tid)
             loopTable[tid][idx].specIter + (uint16_t)inFlightCount + 1u;
         inst->setLoopFetchIter(fetchIter);
         entry.loopPcIdx = idx;
+
+        // CC predictor (Phase 1.6): compute register change delta from
+        // committed state since the last time this branch PC committed.
+        entry.ccPcIdx = (int16_t)idx;  // same hash as loop table
+
+        int8_t s0 = -1, s1 = -1;
+        const RegId &r0 = si0->srcRegIdx(0);
+        if (r0.classValue() == IntRegClass && r0.index() != 0)
+            s0 = (int8_t)r0.index();
+        if (si0->numSrcRegs() >= 2) {
+            const RegId &r1 = si0->srcRegIdx(1);
+            if (r1.classValue() == IntRegClass && r1.index() != 0)
+                s1 = (int8_t)r1.index();
+        }
+        entry.ccSrc0 = s0;
+        entry.ccSrc1 = s1;
+
+        const CCVisitEntry &cv = ccVisit[tid][idx];
+        if (!cv.valid) {
+            entry.ccFirst = true;
+        } else {
+            uint32_t c0 = (s0 > 0) ? regCommitCount[tid][s0] : 0u;
+            uint32_t c1 = (s1 > 0) ? regCommitCount[tid][s1] : 0u;
+            uint32_t d0 = c0 - cv.count0;
+            uint32_t d1 = c1 - cv.count1;
+            entry.ccDelta = (uint8_t)((d0 ^ d1) % CC_DELTA_MOD);
+            entry.ccFirst = false;
+        }
     }
 
     inFlight[tid].push_back(std::move(entry));
@@ -146,6 +183,7 @@ EarlyBranchResolver::commitUpTo(ThreadID tid, InstSeqNum doneSeqNum)
 
         for (int r : front.destIntRegs) {
             if (pendingWrites[tid][r] > 0) pendingWrites[tid][r]--;
+            regCommitCount[tid][r]++;
 
             // Update stride predictor from committed register value.
             if (!intRegIdCached[tid][r]) continue;
@@ -174,6 +212,17 @@ EarlyBranchResolver::commitUpTo(ThreadID tid, InstSeqNum doneSeqNum)
             } else {
                 loopTable[tid][lpIdx].specIter++;
             }
+        }
+
+        // CC predictor: update last-visit counts when a tracked branch commits.
+        // Runs after regCommitCount increments so counts are current.
+        if (front.ccPcIdx >= 0) {
+            int s0 = front.ccSrc0;
+            int s1 = front.ccSrc1;
+            CCVisitEntry &cv = ccVisit[tid][front.ccPcIdx];
+            cv.count0 = (s0 > 0) ? regCommitCount[tid][s0] : 0u;
+            cv.count1 = (s1 > 0) ? regCommitCount[tid][s1] : 0u;
+            cv.valid  = true;
         }
 
         // Drain writeKinds entry for this instruction (seqNum-matched).
@@ -478,6 +527,37 @@ EarlyBranchResolver::tryResolveLoop(const DynInstPtr &inst, ThreadID tid,
     return true;
 }
 
+// ── tryResolveChangeCount (Phase 1.6) ────────────────────────────────────────
+
+bool
+EarlyBranchResolver::tryResolveChangeCount(const DynInstPtr &inst,
+                                            ThreadID tid, bool &taken)
+{
+    // Locate the InFlightEntry written by notifyFetched; search from back
+    // since this inst was just pushed (fetch order).
+    for (auto it = inFlight[tid].rbegin(); it != inFlight[tid].rend(); ++it) {
+        if (it->seqNum != inst->seqNum) continue;
+        if (it->ccPcIdx < 0 || it->ccFirst) return false;
+
+        uint8_t ctr = ccPred[tid][it->ccPcIdx][it->ccDelta];
+        // Only predict when counter is saturated (0 = strongly not-taken,
+        // 3 = strongly taken); intermediate values are too uncertain.
+        if (ctr != 0 && ctr != CC_CONF_MAX) return false;
+
+        taken             = (ctr >= CC_CONF_HIGH);
+        it->ccPredMade    = true;
+        it->ccPredTaken   = taken;
+        ++stats.ccPredFired;
+
+        DPRINTF(EarlyBranchResolver,
+                "[tid:%i] [sn:%llu] EBR CC pred delta=%u ctr=%u -> %s\n",
+                tid, inst->seqNum, it->ccDelta, ctr,
+                taken ? "taken" : "not taken");
+        return true;
+    }
+    return false;
+}
+
 // ── tryResolveWakeup (Phase 2) ────────────────────────────────────────────────
 
 bool
@@ -516,6 +596,19 @@ EarlyBranchResolver::tryResolveWakeup(const DynInstPtr &inst, ThreadID tid,
             taken ? "taken" : "not taken",
             inst->readPredTaken() ? "taken" : "not taken",
             mispredicted ? "MISPRED" : "correct");
+
+    // Update CC predictor table with the actual outcome.
+    for (auto &e : inFlight[tid]) {
+        if (e.seqNum != inst->seqNum || e.ccPcIdx < 0) continue;
+        uint8_t &ctr = ccPred[tid][e.ccPcIdx][e.ccDelta];
+        if (taken && ctr < CC_CONF_MAX) ctr++;
+        else if (!taken && ctr > 0) ctr--;
+        if (e.ccPredMade) {
+            if (e.ccPredTaken == taken) ++stats.ccPredCorrect;
+            else                        ++stats.ccPredWrong;
+        }
+        break;
+    }
 
     // Update loop predictor.
     int idx = loopPcIdx(inst->pcState().instAddr());
@@ -569,7 +662,13 @@ EarlyBranchResolver::EBRStats::EBRStats(CPU *cpu)
       ADD_STAT(wakeupMispredCorrections, statistics::units::Count::get(),
                "Wakeup resolutions that caught a BPU misprediction early"),
       ADD_STAT(earlySquashesInitiated, statistics::units::Count::get(),
-               "Squashes initiated at wakeup time (1 cycle before execute)")
+               "Squashes initiated at wakeup time (1 cycle before execute)"),
+      ADD_STAT(ccPredFired, statistics::units::Count::get(),
+               "CC predictor overrode BPU (Phase 1.6 prediction)"),
+      ADD_STAT(ccPredCorrect, statistics::units::Count::get(),
+               "CC predictor override was correct"),
+      ADD_STAT(ccPredWrong, statistics::units::Count::get(),
+               "CC predictor override was wrong")
 {}
 
 } // namespace o3

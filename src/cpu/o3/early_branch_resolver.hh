@@ -76,6 +76,17 @@ class EarlyBranchResolver
     bool tryResolveLoop(const DynInstPtr &inst, ThreadID tid, bool &taken);
 
     /**
+     * Phase 1.6 — change-count predictor, fetch time.
+     * For branches that Phase 1 and 1.5 could not resolve, uses a 2D
+     * saturating-counter table indexed by (pc hash, register change delta)
+     * to predict direction based on how many times the source registers were
+     * committed since the last visit to this branch PC.
+     * Returns true and sets `taken` if confident.
+     */
+    bool tryResolveChangeCount(const DynInstPtr &inst, ThreadID tid,
+                               bool &taken);
+
+    /**
      * Phase 2 — wakeup time (called from IQ::wakeDependents).
      * All source regs are now in the physical register file.
      * Reads values directly and evaluates the branch condition.
@@ -102,6 +113,10 @@ class EarlyBranchResolver
         statistics::Scalar resolvedAtWakeup;
         statistics::Scalar wakeupMispredCorrections;
         statistics::Scalar earlySquashesInitiated;
+        // Change-count predictor (Phase 1.6)
+        statistics::Scalar ccPredFired;
+        statistics::Scalar ccPredCorrect;
+        statistics::Scalar ccPredWrong;
     } stats;
 
   private:
@@ -115,9 +130,16 @@ class EarlyBranchResolver
     struct InFlightEntry {
         InstSeqNum seqNum;
         std::vector<int> destIntRegs;
-        // Loop predictor: if this is a conditional branch, record the
-        // PC table index so squashAfter can decrement the specIter.
+        // Loop predictor
         int  loopPcIdx = -1;   // -1 means not a tracked loop branch
+        // Change-count predictor (Phase 1.6)
+        int16_t ccPcIdx     = -1;  // -1 = not a CC-tracked branch
+        uint8_t ccDelta     = 0;   // (d0 XOR d1) % CC_DELTA_MOD
+        bool    ccFirst     = true; // true = first visit, no prediction made
+        bool    ccPredMade  = false;
+        bool    ccPredTaken = false;
+        int8_t  ccSrc0      = -1;  // source reg 0 arch index (-1 = x0/none)
+        int8_t  ccSrc1      = -1;  // source reg 1 arch index (-1 = x0/none)
     };
     std::deque<InFlightEntry> inFlight[MaxThreads];
 
@@ -142,6 +164,29 @@ class EarlyBranchResolver
     LoopEntry loopTable[MaxThreads][LOOP_TABLE_SIZE];
 
     int loopPcIdx(Addr pc) const { return (pc >> 1) & (LOOP_TABLE_SIZE - 1); }
+
+    // ── Change-count predictor (Phase 1.6) ───────────────────────────────
+    // For each conditional branch, counts how many committed writes occurred
+    // to each source register since the last visit to this branch PC.
+    // Indexes a 2D saturating-counter table with (pcIdx, delta_hash) to
+    // predict taken/not-taken based on register mutation patterns.
+    static constexpr int CC_PC_BITS   = 10;
+    static constexpr int CC_PC_SIZE   = 1 << CC_PC_BITS;
+    static constexpr int CC_DELTA_MOD = 16;            // 4-bit delta hash
+    static constexpr uint8_t CC_CONF_MAX  = 7;         // 3-bit saturating
+    static constexpr uint8_t CC_CONF_HIGH = 4;         // midpoint
+    static constexpr uint8_t CC_CONF_INIT = 4;         // neutral start
+
+    struct CCVisitEntry {
+        uint32_t count0 = 0;   // regCommitCount for src0 at last commit
+        uint32_t count1 = 0;   // regCommitCount for src1 at last commit
+        bool     valid  = false;
+    };
+    CCVisitEntry ccVisit[MaxThreads][CC_PC_SIZE];
+    uint8_t      ccPred [MaxThreads][CC_PC_SIZE][CC_DELTA_MOD];
+
+    // Per-architectural-register monotonically increasing commit count.
+    uint32_t regCommitCount[MaxThreads][MaxArchIntRegs];
 };
 
 } // namespace o3

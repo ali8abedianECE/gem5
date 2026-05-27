@@ -987,6 +987,26 @@ BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
                         inst->staticInst->advancePC(fetch_pc);
                     }
                     predict_taken = loop_taken;
+                } else {
+                    // Phase 1.6: change-count predictor — uses register
+                    // mutation count since last visit to predict direction.
+                    bool cc_taken;
+                    if (cpu->ebr.tryResolveChangeCount(inst, tid, cc_taken)) {
+                        if (cc_taken != predict_taken) {
+                            if (cc_taken) {
+                                auto tgt = inst->staticInst->branchTarget(
+                                    inst->pcState());
+                                if (tgt) {
+                                    set(fetch_pc, *tgt);
+                                    ++stats.predTakenBranches;
+                                }
+                            } else {
+                                set(fetch_pc, inst->pcState());
+                                inst->staticInst->advancePC(fetch_pc);
+                            }
+                        }
+                        predict_taken = cc_taken;
+                    }
                 }
             }
         }
