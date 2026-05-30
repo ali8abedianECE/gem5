@@ -988,10 +988,11 @@ BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
                     }
                     predict_taken = loop_taken;
                 } else {
-                    // Phase 1.6: change-count predictor — uses register
-                    // mutation count since last visit to predict direction.
+                    // Phase 1.6: 2D saturating-counter change-count predictor.
                     bool cc_taken;
-                    if (cpu->ebr.tryResolveChangeCount(inst, tid, cc_taken)) {
+                    bool cc_fired = cpu->ebr.tryResolveChangeCount(
+                                        inst, tid, cc_taken);
+                    if (cc_fired) {
                         if (cc_taken != predict_taken) {
                             if (cc_taken) {
                                 auto tgt = inst->staticInst->branchTarget(
@@ -1006,10 +1007,34 @@ BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
                             }
                         }
                         predict_taken = cc_taken;
+                    } else {
+                        // Phase 1.7: perceptron predictor on register change
+                        // delta features when Phase 1.6 is not confident.
+                        bool perc_taken;
+                        if (cpu->ebr.tryResolvePerceptron(
+                                inst, tid, perc_taken)) {
+                            if (perc_taken != predict_taken) {
+                                if (perc_taken) {
+                                    auto tgt = inst->staticInst->branchTarget(
+                                        inst->pcState());
+                                    if (tgt) {
+                                        set(fetch_pc, *tgt);
+                                        ++stats.predTakenBranches;
+                                    }
+                                } else {
+                                    set(fetch_pc, inst->pcState());
+                                    inst->staticInst->advancePC(fetch_pc);
+                                }
+                            }
+                            predict_taken = perc_taken;
+                        }
                     }
                 }
             }
         }
+
+        // Finalize speculative GHR for the GHR perceptron (Phase 1.7).
+        cpu->ebr.notifyPredicted(inst, tid, predict_taken);
 
         DPRINTF(BAC,
                 "[tid:%i] [sn:%llu] Branch at PC %#x "

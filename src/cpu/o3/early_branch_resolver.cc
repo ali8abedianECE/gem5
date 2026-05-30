@@ -64,16 +64,18 @@ EarlyBranchResolver::EarlyBranchResolver(CPU *_cpu,
 {
     for (int tid = 0; tid < MaxThreads; tid++) {
         for (int r = 0; r < MaxArchIntRegs; r++) {
-            pendingWrites[tid][r]    = 0;
-            regCommitCount[tid][r]   = 0;
+            pendingWrites[tid][r]  = 0;
+            regCommitCount[tid][r] = 0;
         }
         for (int i = 0; i < LOOP_TABLE_SIZE; i++)
             loopTable[tid][i] = LoopEntry{};
         for (int i = 0; i < CC_PC_SIZE; i++) {
             ccVisit[tid][i] = CCVisitEntry{};
             for (int d = 0; d < CC_DELTA_MOD; d++)
-                ccPred[tid][i][d] = CC_CONF_INIT;  // neutral: requires 4 same-dir outcomes
+                ccPred[tid][i][d] = CC_CONF_INIT;
         }
+        for (int i = 0; i < PERC_TABLE_SIZE; i++)
+            percTable[tid][i] = PercEntry{};
     }
 }
 
@@ -160,12 +162,36 @@ EarlyBranchResolver::notifyFetched(const DynInstPtr &inst, ThreadID tid)
         if (!cv.valid) {
             entry.ccFirst = true;
         } else {
-            uint32_t c0 = (s0 > 0) ? regCommitCount[tid][s0] : 0u;
-            uint32_t c1 = (s1 > 0) ? regCommitCount[tid][s1] : 0u;
-            uint32_t d0 = c0 - cv.count0;
-            uint32_t d1 = c1 - cv.count1;
-            entry.ccDelta = (uint8_t)((d0 ^ d1) % CC_DELTA_MOD);
+            uint32_t c0    = (s0 > 0) ? regCommitCount[tid][s0] : 0u;
+            uint32_t c1    = (s1 > 0) ? regCommitCount[tid][s1] : 0u;
+            uint32_t d0raw = c0 - cv.count0;
+            uint32_t d1raw = c1 - cv.count1;
+            entry.ccDelta = (uint8_t)((d0raw ^ d1raw) % CC_DELTA_MOD);
             entry.ccFirst = false;
+        }
+
+        // Phase 1.7 GHR perceptron: dot product against current speculative
+        // history bits.  Computed for ALL conditional branches so the weight
+        // table trains on every visit, not just post-first-commit visits.
+        // Table index XORs PC hash with folded GHR for path-sensitivity.
+        entry.isGhrBranch = true;
+        entry.ghrSnap     = specGhr[tid];
+        {
+            Addr pc = inst->pcState().instAddr();
+            uint32_t ghr = entry.ghrSnap;
+            // Fold 32-bit GHR down to PERC_TABLE_BITS by XOR-folding.
+            uint32_t foldedGhr = (ghr ^ (ghr >> PERC_TABLE_BITS)) &
+                                  (PERC_TABLE_SIZE - 1);
+            int percIdx = (int)(((pc >> 1) ^ foldedGhr) & (PERC_TABLE_SIZE - 1));
+            entry.percPcIdx = (int16_t)percIdx;
+
+            const PercEntry &pe = percTable[tid][percIdx];
+            int16_t y = pe.w[0];  // bias term
+            for (int i = 0; i < PERC_N_HIST; i++) {
+                int16_t h = ((ghr >> i) & 1u) ? int16_t(1) : int16_t(-1);
+                y += (int16_t)pe.w[i + 1] * h;
+            }
+            entry.percY = y;
         }
     }
 
@@ -213,6 +239,10 @@ EarlyBranchResolver::commitUpTo(ThreadID tid, InstSeqNum doneSeqNum)
                 loopTable[tid][lpIdx].specIter++;
             }
         }
+
+        // GHR perceptron: advance committed GHR when a conditional branch commits.
+        if (front.isGhrBranch && front.actualTakenSet)
+            commitGhr[tid] = (commitGhr[tid] << 1) | (front.actualTaken ? 1u : 0u);
 
         // CC predictor: update last-visit counts when a tracked branch commits.
         // Runs after regCommitCount increments so counts are current.
@@ -262,6 +292,15 @@ EarlyBranchResolver::squashAfter(ThreadID tid, InstSeqNum squashSeqNum)
     while (!writeKinds[tid].empty() &&
            writeKinds[tid].back().seqNum > squashSeqNum)
         writeKinds[tid].pop_back();
+
+    // Restore speculative GHR to the last surviving conditional branch's state.
+    specGhr[tid] = commitGhr[tid];
+    for (auto it = inFlight[tid].rbegin(); it != inFlight[tid].rend(); ++it) {
+        if (it->isGhrBranch && it->ghrAfterSet) {
+            specGhr[tid] = it->ghrAfter;
+            break;
+        }
+    }
 
     rebuildCounts(tid);
 }
@@ -558,6 +597,48 @@ EarlyBranchResolver::tryResolveChangeCount(const DynInstPtr &inst,
     return false;
 }
 
+// ── tryResolvePerceptron (Phase 1.7) ─────────────────────────────────────────
+
+bool
+EarlyBranchResolver::tryResolvePerceptron(const DynInstPtr &inst,
+                                           ThreadID tid, bool &taken)
+{
+    for (auto it = inFlight[tid].rbegin(); it != inFlight[tid].rend(); ++it) {
+        if (it->seqNum != inst->seqNum) continue;
+        if (!it->isGhrBranch || it->percPcIdx < 0) return false;
+
+        int16_t y = it->percY;
+        if (y <= PERC_THETA && y >= -PERC_THETA) return false;  // not confident
+
+        taken              = (y > 0);
+        it->percPredMade   = true;
+        it->percPredTaken  = taken;
+        ++stats.percPredFired;
+
+        DPRINTF(EarlyBranchResolver,
+                "[tid:%i] [sn:%llu] EBR perceptron y=%d -> %s\n",
+                tid, inst->seqNum, y, taken ? "taken" : "not taken");
+        return true;
+    }
+    return false;
+}
+
+// ── notifyPredicted ───────────────────────────────────────────────────────────
+
+void
+EarlyBranchResolver::notifyPredicted(const DynInstPtr &inst, ThreadID tid,
+                                      bool predicted_taken)
+{
+    for (auto it = inFlight[tid].rbegin(); it != inFlight[tid].rend(); ++it) {
+        if (it->seqNum != inst->seqNum) continue;
+        if (!it->isGhrBranch) return;
+        it->ghrAfter    = (it->ghrSnap << 1) | (predicted_taken ? 1u : 0u);
+        it->ghrAfterSet = true;
+        specGhr[tid]    = it->ghrAfter;
+        return;
+    }
+}
+
 // ── tryResolveWakeup (Phase 2) ────────────────────────────────────────────────
 
 bool
@@ -597,15 +678,46 @@ EarlyBranchResolver::tryResolveWakeup(const DynInstPtr &inst, ThreadID tid,
             inst->readPredTaken() ? "taken" : "not taken",
             mispredicted ? "MISPRED" : "correct");
 
-    // Update CC predictor table with the actual outcome.
+    // Update CC + perceptron predictors with the actual outcome.
     for (auto &e : inFlight[tid]) {
         if (e.seqNum != inst->seqNum || e.ccPcIdx < 0) continue;
+
+        // CC saturating counter update.
         uint8_t &ctr = ccPred[tid][e.ccPcIdx][e.ccDelta];
         if (taken && ctr < CC_CONF_MAX) ctr++;
         else if (!taken && ctr > 0) ctr--;
         if (e.ccPredMade) {
             if (e.ccPredTaken == taken) ++stats.ccPredCorrect;
             else                        ++stats.ccPredWrong;
+        }
+
+        // GHR perceptron weight update (Phase 1.7).
+        // Record actual outcome for committed GHR update.
+        e.actualTaken    = taken;
+        e.actualTakenSet = true;
+
+        if (e.isGhrBranch && e.percPcIdx >= 0) {
+            int16_t y      = e.percY;
+            bool wrong     = e.percPredMade && (e.percPredTaken != taken);
+            bool low_conf  = (y >= -PERC_THETA && y <= PERC_THETA);
+            if (wrong || low_conf) {
+                int8_t sign = taken ? int8_t(1) : int8_t(-1);
+                PercEntry &pe = percTable[tid][e.percPcIdx];
+                auto clamp = [](int16_t v) -> int8_t {
+                    return (int8_t)(v > PERC_W_MAX ? PERC_W_MAX :
+                                    v < -PERC_W_MAX ? -PERC_W_MAX : v);
+                };
+                pe.w[0] = clamp((int16_t)pe.w[0] + sign);  // bias
+                uint32_t ghr = e.ghrSnap;
+                for (int i = 0; i < PERC_N_HIST; i++) {
+                    int16_t h = ((ghr >> i) & 1u) ? int16_t(1) : int16_t(-1);
+                    pe.w[i + 1] = clamp((int16_t)pe.w[i + 1] + sign * h);
+                }
+            }
+            if (e.percPredMade) {
+                if (e.percPredTaken == taken) ++stats.percPredCorrect;
+                else                          ++stats.percPredWrong;
+            }
         }
         break;
     }
@@ -668,7 +780,13 @@ EarlyBranchResolver::EBRStats::EBRStats(CPU *cpu)
       ADD_STAT(ccPredCorrect, statistics::units::Count::get(),
                "CC predictor override was correct"),
       ADD_STAT(ccPredWrong, statistics::units::Count::get(),
-               "CC predictor override was wrong")
+               "CC predictor override was wrong"),
+      ADD_STAT(percPredFired, statistics::units::Count::get(),
+               "Perceptron predictor overrode BPU (Phase 1.7 prediction)"),
+      ADD_STAT(percPredCorrect, statistics::units::Count::get(),
+               "Perceptron predictor override was correct"),
+      ADD_STAT(percPredWrong, statistics::units::Count::get(),
+               "Perceptron predictor override was wrong")
 {}
 
 } // namespace o3

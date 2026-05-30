@@ -87,6 +87,23 @@ class EarlyBranchResolver
                                bool &taken);
 
     /**
+     * Phase 1.7 — GHR perceptron predictor, fetch time.
+     * Falls back here when Phase 1.6 is not confident. Dots a per-PC weight
+     * vector against recent branch history bits (±1 per bit) to predict.
+     * Returns true and sets `taken` if |y| > PERC_THETA.
+     */
+    bool tryResolvePerceptron(const DynInstPtr &inst, ThreadID tid,
+                              bool &taken);
+
+    /**
+     * Called from BAC after all prediction phases have run for a conditional
+     * branch.  Updates the speculative GHR with the final predicted direction
+     * so subsequent branches see an up-to-date history.
+     */
+    void notifyPredicted(const DynInstPtr &inst, ThreadID tid,
+                         bool predicted_taken);
+
+    /**
      * Phase 2 — wakeup time (called from IQ::wakeDependents).
      * All source regs are now in the physical register file.
      * Reads values directly and evaluates the branch condition.
@@ -117,6 +134,10 @@ class EarlyBranchResolver
         statistics::Scalar ccPredFired;
         statistics::Scalar ccPredCorrect;
         statistics::Scalar ccPredWrong;
+        // Perceptron predictor (Phase 1.7)
+        statistics::Scalar percPredFired;
+        statistics::Scalar percPredCorrect;
+        statistics::Scalar percPredWrong;
     } stats;
 
   private:
@@ -132,14 +153,25 @@ class EarlyBranchResolver
         std::vector<int> destIntRegs;
         // Loop predictor
         int  loopPcIdx = -1;   // -1 means not a tracked loop branch
-        // Change-count predictor (Phase 1.6)
-        int16_t ccPcIdx     = -1;  // -1 = not a CC-tracked branch
-        uint8_t ccDelta     = 0;   // (d0 XOR d1) % CC_DELTA_MOD
-        bool    ccFirst     = true; // true = first visit, no prediction made
-        bool    ccPredMade  = false;
-        bool    ccPredTaken = false;
-        int8_t  ccSrc0      = -1;  // source reg 0 arch index (-1 = x0/none)
-        int8_t  ccSrc1      = -1;  // source reg 1 arch index (-1 = x0/none)
+        // CC predictor (Phase 1.6)
+        int16_t ccPcIdx      = -1;  // -1 = not a tracked branch
+        uint8_t ccDelta      = 0;   // (d0 XOR d1) % CC_DELTA_MOD
+        bool    ccFirst      = true;
+        bool    ccPredMade   = false;
+        bool    ccPredTaken  = false;
+        int8_t  ccSrc0       = -1;
+        int8_t  ccSrc1       = -1;
+        // GHR perceptron (Phase 1.7)
+        int16_t percPcIdx     = -1;  // path-sensitive table index (separate from ccPcIdx)
+        int16_t percY         = 0;   // dot product at fetch time
+        bool    percPredMade  = false;
+        bool    percPredTaken = false;
+        uint32_t ghrSnap      = 0;   // speculative GHR before this branch
+        uint32_t ghrAfter     = 0;   // GHR after prediction (for squash restore)
+        bool     ghrAfterSet  = false;
+        bool     isGhrBranch  = false; // true = conditional direct branch
+        bool     actualTaken  = false; // actual outcome (set at wakeup)
+        bool     actualTakenSet = false;
     };
     std::deque<InFlightEntry> inFlight[MaxThreads];
 
@@ -187,6 +219,27 @@ class EarlyBranchResolver
 
     // Per-architectural-register monotonically increasing commit count.
     uint32_t regCommitCount[MaxThreads][MaxArchIntRegs];
+
+    // ── GHR perceptron predictor (Phase 1.7) ─────────────────────────────
+    // Per-branch-PC weight table indexed by PC hash.
+    // Feature vector: [1, h0, h1, ..., h_{N-1}] where h_i = ±1 from GHR bit i.
+    // y = Σ w[i]*h[i]. Confident if |y| > PERC_THETA; train if wrong OR low-conf.
+    static constexpr int    PERC_TABLE_BITS  = 12;              // 4K entries
+    static constexpr int    PERC_TABLE_SIZE  = 1 << PERC_TABLE_BITS;
+    static constexpr int    PERC_N_HIST      = 16;              // GHR bits used
+    static constexpr int    PERC_N_WEIGHTS   = PERC_N_HIST + 1; // +1 for bias
+    static constexpr int8_t PERC_W_MAX       = 127;  // int8_t weight bound
+    static constexpr int    PERC_THETA       = 500;  // confidence threshold
+
+    struct PercEntry {
+        int8_t w[PERC_N_WEIGHTS];
+        PercEntry() { for (int i = 0; i < PERC_N_WEIGHTS; i++) w[i] = 0; }
+    };
+    PercEntry percTable[MaxThreads][PERC_TABLE_SIZE];
+
+    // Speculative GHR: updated at fetch via notifyPredicted(), rolled back on squash.
+    uint32_t specGhr  [MaxThreads] = {};
+    uint32_t commitGhr[MaxThreads] = {};
 };
 
 } // namespace o3
